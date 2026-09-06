@@ -88,6 +88,7 @@ RUN /opencascade.js/src/generateBindings.py
 
 # --- Stage: Compile bindings and finalize ---
 FROM bindings-generated AS custom-build-image
+ENV SKIP_MAIN_BINDINGS=1
 RUN \
   /opencascade.js/src/compileBindings.py ${threading} && \
   chmod -R 777 /opencascade.js/ && \

@@ -51,6 +51,13 @@ def compileCustomCodeBindings(args):
   for dirpath, dirnames, filenames in os.walk(libraryBasePath + "/myMain.h"):
     filesToBuild.extend(map(lambda x: dirpath + "/" + x, filter(lambda x: x.endswith(".cpp"), filenames)))
 
+  # c2-geometry never exposes raw OCCT types across the JS boundary, so skip
+  # compiling the Handle_/NCollection typedef bindings generateBindings.py
+  # writes into myMain.h alongside real custom code (thousands of files).
+  if os.environ.get("SKIP_MAIN_BINDINGS") == "1":
+    _infraPrefixes = ("Handle_", "TColgp_", "TColStd_", "TopTools_", "Poly_Array", "NCollection_")
+    filesToBuild = [f for f in filesToBuild if not os.path.basename(f).startswith(_infraPrefixes)]
+
   total = len(filesToBuild)
   print(f"Compiling {total} custom binding files...")
 
@@ -81,6 +88,13 @@ if __name__ == "__main__":
   parser = ArgumentParser()
   parser.add_argument(dest="threading", choices=["single-threaded", "multi-threaded"], help="Build in single vs. multi-threaded mode")
   args = parser.parse_args()
+
+  # c2-geometry's recipe binds zero raw OCCT classes (only a custom wrapper
+  # class), so none of these generated per-class .o files ever get linked.
+  # Skip compiling them entirely rather than paying for ~7790 unused files.
+  if os.environ.get("SKIP_MAIN_BINDINGS") == "1":
+    print("SKIP_MAIN_BINDINGS=1: skipping compilation of generated OCCT class bindings.")
+    sys.exit(0)
 
   filesToBuild = []
   for dirpath, dirnames, filenames in os.walk(libraryBasePath):
