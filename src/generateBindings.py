@@ -5,78 +5,17 @@ from bindings import EmbindBindings, TypescriptBindings, shouldProcessClass
 import clang.cindex
 import os
 import errno
-from filter.filterTypedefs import filterTypedef
-from filter.filterEnums import filterEnum
-from wasmGenerator.Common import ignoreDuplicateTypedef, SkipException
-from Common import ocIncludeFiles, includePathArgs
+from wasmGenerator.Common import SkipException
+from Common import ocIncludeStatements
 import json
-import multiprocessing
 import os
 from filter.filterPackages import filterPackages
-from functools import partial
+from TuInfo import TuInfo
+from Occt8Compat import handleTypedefs, ncollectionTypedefs
 
 libraryBasePath = "/opencascade.js/build/bindings"
 buildDirectory = "/opencascade.js/build"
 occtBasePath = "/occt/src/"
-ocIncludeStatements = os.linesep.join(map(lambda x: "#include \"" + os.path.basename(x) + "\"", list(sorted(ocIncludeFiles))))
-
-import re as _re
-
-def _generateHandleTypedefs() -> str:
-  """Generate Handle_ClassName typedefs for all OCCT classes using DEFINE_STANDARD_RTTIEXT.
-
-  OCCT 8.0 removed DEFINE_STANDARD_HANDLE from most classes, so Handle_ClassName
-  typedefs no longer exist. The binding generator needs these typedefs to create
-  Handle binding files via templateTypedefGenerator.
-  """
-  typedefs = []
-  seen = set()
-  pattern = _re.compile(r'DEFINE_STANDARD_RTTIEXT\s*\(\s*(\w+)\s*,')
-  # Classes that are macro parameters or unavailable in WASM builds
-  _skip = {'Class'}
-  _skip_prefixes = ('IVtk', 'IVtkVTK', 'IVtkOCC', 'IVtkDraw')
-  for dirpath, dirnames, filenames in os.walk(occtBasePath):
-    for fname in filenames:
-      if not fname.endswith('.hxx'):
-        continue
-      filepath = os.path.join(dirpath, fname)
-      try:
-        with open(filepath, 'r', errors='replace') as f:
-          for line in f:
-            m = pattern.search(line)
-            if m:
-              className = m.group(1)
-              if className in _skip or className.startswith(_skip_prefixes):
-                continue
-              if className not in seen:
-                seen.add(className)
-                typedefs.append(
-                  f"typedef opencascade::handle<{className}> Handle_{className};"
-                )
-      except OSError:
-        pass
-  return "\n".join(typedefs)
-
-handleTypedefs = _generateHandleTypedefs()
-print(f"Generated {len(handleTypedefs.splitlines())} Handle typedefs for OCCT 8.0 compatibility")
-
-# OCCT 8.0 moved NCollection aliases to Deprecated/NCollectionAliases/.
-# We can't #include those headers (some have broken #include chains referencing
-# removed OCCT types). Instead, inject the needed typedefs directly into myMain.h.
-# Add entries here for any NCollection alias your build config requires.
-ncollectionTypedefs = "\n".join([
-  "typedef NCollection_Array1<gp_Pnt> TColgp_Array1OfPnt;",
-  "typedef NCollection_Array1<gp_Dir> TColgp_Array1OfDir;",
-  "typedef NCollection_Array1<gp_Pnt2d> TColgp_Array1OfPnt2d;",
-  "typedef NCollection_Array1<gp_Vec> TColgp_Array1OfVec;",
-  "typedef NCollection_Array1<double> TColStd_Array1OfReal;",
-  "typedef NCollection_Array1<int> TColStd_Array1OfInteger;",
-  "typedef NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> TopTools_IndexedMapOfShape;",
-  "typedef NCollection_Array1<Poly_Triangle> Poly_Array1OfTriangle;",
-  "typedef NCollection_HArray1<gp_Pnt> TColgp_HArray1OfPnt;",
-  "typedef opencascade::handle<TColgp_HArray1OfPnt> Handle_TColgp_HArray1OfPnt;",
-])
-print(f"Injecting {len(ncollectionTypedefs.splitlines())} NCollection typedefs for OCCT 8.0 compatibility")
 
 def mkdirp(name: str) -> None:
   try:
@@ -154,24 +93,21 @@ def filterEnums(child, customBuild):
     child.kind == clang.cindex.CursorKind.ENUM_DECL
   )
 
-def processChildBatch(customCode, generator, buildType: str, extension: str, filterFunction: Callable[[any], bool], processFunction: Callable[[any, any], str], typedefGenerator: any, templateTypedefGenerator: any, preamble: str, customBuild: bool, batch):
-  tu = parse(customCode)
-  children = list(generator(tu)[batch.start:batch.stop])
-
+def processChildren(tuInfo: TuInfo, children, extension: str, filterFunction: Callable[[any], bool], processFunction: Callable[[any, any], str], preamble: str, customBuild: bool):
   for child in children:
     if not filterFunction(child, customBuild) or child.spelling == "":
       continue
 
     relOcFileName: str = child.extent.start.file.name.replace(occtBasePath, "")
-    mkdirp(buildDirectory + "/" + buildType + "/" + os.path.dirname(relOcFileName))
-    mkdirp(buildDirectory + "/" + buildType + "/" + relOcFileName)
-    filename = buildDirectory + "/" + buildType + "/" + relOcFileName + "/" + (child.spelling if not child.spelling == "" else child.type.spelling) + extension
+    mkdirp(buildDirectory + "/bindings/" + os.path.dirname(relOcFileName))
+    mkdirp(buildDirectory + "/bindings/" + relOcFileName)
+    filename = buildDirectory + "/bindings/" + relOcFileName + "/" + (child.spelling if not child.spelling == "" else child.type.spelling) + extension
 
     if not os.path.exists(filename):
       if not child.spelling.startswith("("):
         print("Processing " + child.spelling)
         try:
-          output = processFunction(tu, preamble, child, typedefGenerator(tu), templateTypedefGenerator(tu))
+          output = processFunction(tuInfo, preamble, child)
           bindingsFile = open(filename, "w")
           bindingsFile.write(output)
         except SkipException as e:
@@ -184,17 +120,6 @@ def processChildBatch(customCode, generator, buildType: str, extension: str, fil
 def split(a, n):
   k, m = divmod(len(a), n)
   return (a[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n))
-
-def processChildren(generator, buildType: str, extension: str, filterFunction: Callable[[any], bool], processFunction: Callable[[any, any], str], typedefs: any, templateTypedefs: any, preamble: str, customCode, customBuild):
-  tu = parse(customCode)
-  func = partial(processChildBatch, customCode, generator, buildType, extension, filterFunction, processFunction, typedefs, templateTypedefs, preamble, customBuild)
-  if not customBuild:
-    numthreads = multiprocessing.cpu_count()
-    batches = split(range(len(generator(tu))), numthreads)
-    with multiprocessing.Pool(processes=numthreads) as p:
-      p.map(func, batches)
-  else:
-    func(range(len(generator(tu))))
 
 def processTemplate(child):
   templateRefs = list(filter(lambda x: x.kind == clang.cindex.CursorKind.TEMPLATE_REF, child.get_children()))
@@ -214,60 +139,32 @@ def processTemplate(child):
   
   return [templateClass, templateArgs]
 
-def embindGenerationFuncClasses(tu, preamble, child, typedefs, templateTypedefs) -> str:
-  embindings = EmbindBindings(typedefs, templateTypedefs, tu)
+def embindGenerationFuncClasses(tuInfo: TuInfo, preamble, child) -> str:
+  embindings = EmbindBindings(tuInfo)
   output = embindings.processClass(child)
 
   return preamble + output
 
-def embindGenerationFuncTemplates(tu, preamble, child, typedefs, templateTypedefs) -> str:
+def embindGenerationFuncTemplates(tuInfo: TuInfo, preamble, child) -> str:
   [templateClass, templateArgs] = processTemplate(child)
-  embindings = EmbindBindings(typedefs, templateTypedefs, tu)
+  embindings = EmbindBindings(tuInfo)
   output = embindings.processClass(templateClass, child, templateArgs)
 
   return preamble + output
 
-def embindGenerationFuncEnums(tu, preamble, child, typedefs, templateTypedefs) -> str:
-  embindings = EmbindBindings(typedefs, templateTypedefs, tu)
+def embindGenerationFuncEnums(tuInfo: TuInfo, preamble, child) -> str:
+  embindings = EmbindBindings(tuInfo)
   output = embindings.processEnum(child)
 
   return preamble + output
 
-_generator_cache = {}
+def process(tuInfo: TuInfo, extension, embindGenerationFuncClasses, embindGenerationFuncTemplates, embindGenerationFuncEnums, preamble, customBuild):
+  processChildren(tuInfo, tuInfo.allChildren, extension, filterClasses, embindGenerationFuncClasses, preamble, customBuild)
+  processChildren(tuInfo, tuInfo.templateTypedefs, extension, filterTemplates, embindGenerationFuncTemplates, preamble, customBuild)
+  processChildren(tuInfo, tuInfo.enums, extension, filterEnums, embindGenerationFuncEnums, preamble, customBuild)
 
-def _cached_generator(name, tu, filter_fn=None):
-  key = (name, id(tu))
-  if key in _generator_cache:
-    return _generator_cache[key]
-  children = list(tu.cursor.get_children())
-  result = list(filter(filter_fn, children)) if filter_fn else children
-  _generator_cache[key] = result
-  return result
-
-def templateTypedefGenerator(tu):
-  return _cached_generator("templateTypedef", tu, lambda x:
-      x.kind == clang.cindex.CursorKind.TYPEDEF_DECL and
-      not (x.get_definition() is None or not x == x.get_definition()) and
-      filterTypedef(x) and
-      x.type.get_num_template_arguments() != -1 and
-      not ignoreDuplicateTypedef(x))
-
-def typedefGenerator(tu):
-  return _cached_generator("typedef", tu, lambda x: x.kind == clang.cindex.CursorKind.TYPEDEF_DECL)
-
-def allChildrenGenerator(tu):
-  return _cached_generator("allChildren", tu)
-
-def enumGenerator(tu):
-  return _cached_generator("enum", tu, lambda x: x.kind == clang.cindex.CursorKind.ENUM_DECL and filterEnum(x))
-
-def process(extension, embindGenerationFuncClasses, embindGenerationFuncTemplates, embindGenerationFuncEnums, preamble, customCode, customBuild):
-  processChildren(allChildrenGenerator, "bindings", extension, filterClasses, embindGenerationFuncClasses, typedefGenerator, templateTypedefGenerator, preamble, customCode, customBuild)
-  processChildren(templateTypedefGenerator, "bindings", extension, filterTemplates, embindGenerationFuncTemplates, typedefGenerator, templateTypedefGenerator, preamble, customCode, customBuild)
-  processChildren(enumGenerator, "bindings", extension, filterEnums, embindGenerationFuncEnums, typedefGenerator, templateTypedefGenerator, preamble, customCode, customBuild)
-
-def typescriptGenerationFuncClasses(tu, preamble, child, typedefs, templateTypedefs) -> str:
-  typescript = TypescriptBindings(typedefs, templateTypedefs, tu)
+def typescriptGenerationFuncClasses(tuInfo: TuInfo, preamble, child) -> str:
+  typescript = TypescriptBindings(tuInfo)
   output = typescript.processClass(child)
 
   return json.dumps({
@@ -276,9 +173,9 @@ def typescriptGenerationFuncClasses(tu, preamble, child, typedefs, templateTyped
     "exports": typescript.exports,
   })
 
-def typescriptGenerationFuncTemplates(tu, preamble, child, typedefs, templateTypedefs) -> str:
+def typescriptGenerationFuncTemplates(tuInfo: TuInfo, preamble, child) -> str:
   [templateClass, templateArgs] = processTemplate(child)
-  typescript = TypescriptBindings(typedefs, templateTypedefs, tu)
+  typescript = TypescriptBindings(tuInfo)
   output = typescript.processClass(templateClass, child, templateArgs)
 
   return json.dumps({
@@ -287,8 +184,8 @@ def typescriptGenerationFuncTemplates(tu, preamble, child, typedefs, templateTyp
     "exports": typescript.exports,
   })
 
-def typescriptGenerationFuncEnums(tu, preamble, child, typedefs, templateTypedefs) -> str:
-  typescript = TypescriptBindings(typedefs, templateTypedefs, tu)
+def typescriptGenerationFuncEnums(tuInfo: TuInfo, preamble, child) -> str:
+  typescript = TypescriptBindings(tuInfo)
   output = typescript.processEnum(child)
 
   return json.dumps({
@@ -296,32 +193,6 @@ def typescriptGenerationFuncEnums(tu, preamble, child, typedefs, templateTypedef
     "kind": "enum",
     "exports": typescript.exports,
   })
-
-_parse_cache = {}
-
-def parse(additionalCppCode = ""):
-  if additionalCppCode in _parse_cache:
-    return _parse_cache[additionalCppCode]
-
-  index = clang.cindex.Index.create()
-  translationUnit = index.parse(
-    "myMain.h", [
-      "-x",
-      "c++",
-      "-std=c++17",
-      "-stdlib=libc++",
-      "-D__EMSCRIPTEN__"
-    ] + includePathArgs,
-    [["myMain.h", ocIncludeStatements + "\n" + handleTypedefs + "\n" + ncollectionTypedefs + "\n" + additionalCppCode]]
-  )
-
-  if len(translationUnit.diagnostics) > 0:
-    print("Diagnostic Messages:")
-    for d in translationUnit.diagnostics:
-      print("  " + d.format())
-
-  _parse_cache[additionalCppCode] = translationUnit
-  return translationUnit
 
 referenceTypeTemplateDefs = \
   "\n" + \
@@ -357,8 +228,9 @@ def generateCustomCodeBindings(customCode):
 
   embindPreamble = ocIncludeStatements + "\n" + handleTypedefs + "\n" + ncollectionTypedefs + "\n" + referenceTypeTemplateDefs + "\n" + customCode
 
-  process(".cpp", embindGenerationFuncClasses, embindGenerationFuncTemplates, embindGenerationFuncEnums, embindPreamble, customCode, True)
-  process(".d.ts.json", typescriptGenerationFuncClasses, typescriptGenerationFuncTemplates, typescriptGenerationFuncEnums, "", customCode, True)
+  tuInfo = TuInfo(customCode)
+  process(tuInfo, ".cpp", embindGenerationFuncClasses, embindGenerationFuncTemplates, embindGenerationFuncEnums, embindPreamble, True)
+  process(tuInfo, ".d.ts.json", typescriptGenerationFuncClasses, typescriptGenerationFuncTemplates, typescriptGenerationFuncEnums, "", True)
 
 if __name__ == "__main__":
   try:
@@ -366,7 +238,9 @@ if __name__ == "__main__":
   except Exception:
     pass
 
-  embindPreamble = ocIncludeStatements + "\n" + handleTypedefs + "\n" + ncollectionTypedefs + "\n" + referenceTypeTemplateDefs
-  process(".cpp", embindGenerationFuncClasses, embindGenerationFuncTemplates, embindGenerationFuncEnums, embindPreamble, "", False)
+  tuInfo = TuInfo("")
 
-  process(".d.ts.json", typescriptGenerationFuncClasses, typescriptGenerationFuncTemplates, typescriptGenerationFuncEnums, "", "", False)
+  embindPreamble = ocIncludeStatements + "\n" + handleTypedefs + "\n" + ncollectionTypedefs + "\n" + referenceTypeTemplateDefs
+  process(tuInfo, ".cpp", embindGenerationFuncClasses, embindGenerationFuncTemplates, embindGenerationFuncEnums, embindPreamble, False)
+
+  process(tuInfo, ".d.ts.json", typescriptGenerationFuncClasses, typescriptGenerationFuncTemplates, typescriptGenerationFuncEnums, "", False)
